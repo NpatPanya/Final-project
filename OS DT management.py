@@ -7,7 +7,9 @@ from PIL import Image, ImageTk
 import send2trash
 import tempfile
 import psutil
+import multiprocessing
 from concurrent.futures import ThreadPoolExecutor
+import queue
 
 directory = ""
 duplicate_files = {}
@@ -201,76 +203,116 @@ def display_free_space():
         result_text.insert(tk.END, f"{partition.device} - Free Space: {free_space:.2f} GB\n")
 
 
+def process_file(file_path):
+    try:
+        send2trash.send2trash(file_path)
+        return file_path, True
+    except Exception as e:
+        return file_path, False
+
+
+def clean_up_directory_worker(temp_directory, result_queue):
+    file_paths = []
+    for root, dirs, files in os.walk(temp_directory):
+        file_paths.extend([os.path.join(root, file) for file in files])
+        file_paths.extend([os.path.join(root, dir) for dir in dirs])
+
+    with multiprocessing.Pool() as pool:
+        results = pool.map(process_file, file_paths)
+
+    for result in results:
+        result_queue.put(result)
+    result_queue.put(None)  # Signal that we're done
+
 
 def clean_up_directory():
     temp_directory = tempfile.gettempdir()
     num_deleted_files = 0
-    reset_results() 
-    for root, dirs, files in os.walk(temp_directory):
-        for file in files:
-            file_path = os.path.join(root, file)
-            try:
-                send2trash.send2trash(file_path)
-                result_text.insert(tk.END, f"{file}\n")
-                num_deleted_files += 1
-            except Exception as e:
-                continue
-        
-        for dir in dirs:
-            dir_path = os.path.join(root, dir)
-            try:
-                send2trash.send2trash(dir_path)
-                result_text.insert(tk.END, f"{dir}\n")
-                num_deleted_files += 1
-            except Exception as e:
-                continue
+    reset_results()
 
-    result_text.insert(tk.END, f"Disk Cleanup Complete. Deleted {num_deleted_files} files.\n")
-    messagebox.showinfo("Disk Cleanup Complete", "Disk cleanup operation is finished.")
-    display_free_space()
+    result_queue = multiprocessing.Queue()
 
-app = tk.Tk()
-app.title("Duplicate File Finder and DirectCleanup")
+    # Start the worker process
+    process = multiprocessing.Process(target=clean_up_directory_worker, args=(temp_directory, result_queue))
+    process.start()
 
-style = ttk.Style()
-style.configure("TButton", foreground="black", background="blue")
+    def update_gui():
+        try:
+            while True:
+                result = result_queue.get_nowait()
+                if result is None:
+                    break
+                file_path, success = result
+                if success:
+                    result_text.insert(tk.END, f"{os.path.basename(file_path)}\n")
+                    nonlocal num_deleted_files
+                    num_deleted_files += 1
+                else:
+                    result_text.insert(tk.END, f"Failed to delete: {os.path.basename(file_path)}\n")
+                result_text.see(tk.END)
+                app.update_idletasks()
+        except queue.Empty:
+            app.after(100, update_gui)
+            return
 
-app.geometry("800x600")
-app.resizable(True, True)
+        process.join()
+        result_text.insert(tk.END, f"Disk Cleanup Complete. Deleted {num_deleted_files} files/directories.\n")
+        messagebox.showinfo("Disk Cleanup Complete", "Disk cleanup operation is finished.")
+        display_free_space()
 
-label1 = tk.Label(app, text="Duplicate File Finder and Directory Cleanup", font=("Helvetica", 16))
-label1.pack(pady=10)
+    app.after(100, update_gui)
 
-free_space_label = tk.Label(app, text="Free Space Available: Loading...")
-free_space_label.pack(padx=10, anchor="w")
 
-tree = ttk.Treeview(app, columns=("File 1", "File 2"), show="headings", height=10)
-tree.heading("File 1", text="Duplicated File")
-tree.heading("File 2", text="Original File")
-tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+def main():
+    global app
+    app = tk.Tk()
+    app.title("Duplicate File Finder and DirectCleanup")
 
-# Create a frame for the buttons and pack it to the left side
-button_frame = tk.Frame(app)
-button_frame.pack(side=tk.LEFT, padx=100)
+    style = ttk.Style()
+    style.configure("TButton", foreground="black", background="blue")
 
-browse_button = ttk.Button(app, text="Browse Directory", command=browse_directory)
-select_all_button = ttk.Button(app, text="Select All", command=select_all)
-delete_button = ttk.Button(app, text="Delete Selected", command=delete_selected)
-cleanup_button = ttk.Button(app, text="Disk Cleanup", command=clean_up_directory)
-separator1 = ttk.Separator(app, orient="horizontal")
-preview_button = ttk.Button(app, text="Preview Selected", command=preview_selected)
-manual_button = ttk.Button(app, text="User Manual", command=display_manual)
+    app.geometry("800x600")
+    app.resizable(True, True)
 
-browse_button.pack(in_=button_frame, pady=10, anchor='w')
-select_all_button.pack(in_=button_frame, pady=10, anchor='w')
-delete_button.pack(in_=button_frame, pady=10, anchor='w')
-cleanup_button.pack(in_=button_frame, pady=10, anchor='w')
-preview_button.pack(in_=button_frame, pady=10, anchor='w')
-manual_button.pack(in_=button_frame, pady=10, anchor='w')
+    label1 = tk.Label(app, text="Duplicate File Finder and Directory Cleanup", font=("Helvetica", 16))
+    label1.pack(pady=10)
 
-result_text = tk.Text(app, wrap=tk.WORD, width=200, height=25)
-result_text.pack(padx=10)
+    free_space_label = tk.Label(app, text="Free Space Available: Loading...")
+    free_space_label.pack(padx=10, anchor="w")
 
-display_free_space()  # Display free space information when the application starts
+    global tree
+    tree = ttk.Treeview(app, columns=("File 1", "File 2"), show="headings", height=10)
+    tree.heading("File 1", text="Duplicated File")
+    tree.heading("File 2", text="Original File")
+    tree.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-app.mainloop()
+    # Create a frame for the buttons and pack it to the left side
+    button_frame = tk.Frame(app)
+    button_frame.pack(side=tk.LEFT, padx=100)
+
+    browse_button = ttk.Button(app, text="Browse Directory", command=browse_directory)
+    select_all_button = ttk.Button(app, text="Select All", command=select_all)
+    delete_button = ttk.Button(app, text="Delete Selected", command=delete_selected)
+    cleanup_button = ttk.Button(app, text="Disk Cleanup", command=clean_up_directory)
+    separator1 = ttk.Separator(app, orient="horizontal")
+    preview_button = ttk.Button(app, text="Preview Selected", command=preview_selected)
+    manual_button = ttk.Button(app, text="User Manual", command=display_manual)
+
+    browse_button.pack(in_=button_frame, pady=10, anchor='w')
+    select_all_button.pack(in_=button_frame, pady=10, anchor='w')
+    delete_button.pack(in_=button_frame, pady=10, anchor='w')
+    cleanup_button.pack(in_=button_frame, pady=10, anchor='w')
+    preview_button.pack(in_=button_frame, pady=10, anchor='w')
+    manual_button.pack(in_=button_frame, pady=10, anchor='w')
+
+    global result_text
+    result_text = tk.Text(app, wrap=tk.WORD, width=200, height=25)
+    result_text.pack(padx=10)
+
+    display_free_space()  # Display free space information when the application starts
+
+    app.mainloop()
+
+if __name__ == '__main__':
+    multiprocessing.freeze_support()
+    main()
